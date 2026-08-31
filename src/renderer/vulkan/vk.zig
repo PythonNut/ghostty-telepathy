@@ -718,6 +718,14 @@ pub const Device = struct {
         alloc.destroy(self);
     }
 
+    /// Wait for all work on this shared device while excluding queue access
+    /// from other Android renderer instances.
+    pub fn waitIdle(self: *Device) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.vk.vkDeviceWaitIdle(self.device);
+    }
+
     /// Find a memory type index with the given required property flags
     /// covering `type_bits`.
     pub fn findMemoryType(
@@ -900,7 +908,7 @@ pub const FrameSlot = struct {
         try check(self.device.vk.vkBeginCommandBuffer(self.cmd, &begin_info));
     }
 
-    pub fn waitAndCleanup(self: *FrameSlot) Error!void {
+    pub fn waitAndCleanup(self: *FrameSlot) Error!u64 {
         const wait_result = self.device.vk.vkWaitForFences(
             self.device.device,
             1,
@@ -908,12 +916,14 @@ pub const FrameSlot = struct {
             c.VK_TRUE,
             std.math.maxInt(u64),
         );
+        const completed_at_ns = if (wait_result == c.VK_SUCCESS) monotonicNanos() else 0;
         if (wait_result != c.VK_SUCCESS) {
             // Never release a reusable frame slot until the device is idle.
             // The renderer will be marked unhealthy and rebuilt afterward.
-            _ = self.device.vk.vkDeviceWaitIdle(self.device.device);
+            self.device.waitIdle();
             self.cleanupTransients();
-            return check(wait_result);
+            check(wait_result) catch |err| return err;
+            unreachable;
         }
         const reset_result = self.device.vk.vkResetFences(
             self.device.device,
@@ -922,6 +932,7 @@ pub const FrameSlot = struct {
         );
         self.cleanupTransients();
         try check(reset_result);
+        return completed_at_ns;
     }
 
     /// Release resources recorded into a command buffer that was never
@@ -1143,7 +1154,7 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
-        _ = self.device.vk.vkDeviceWaitIdle(self.device.device);
+        self.device.waitIdle();
         self.destroySwapchain();
         if (self.surface != null) self.device.vki.vkDestroySurfaceKHR(
             self.device.instance,
@@ -1190,7 +1201,7 @@ pub const Surface = struct {
         if (self.requested_width == 0 or self.requested_height == 0)
             return error.VulkanFailed;
 
-        _ = self.device.vk.vkDeviceWaitIdle(self.device.device);
+        self.device.waitIdle();
 
         var capabilities: c.VkSurfaceCapabilitiesKHR = undefined;
         try check(self.device.vki.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -1522,7 +1533,9 @@ pub const Surface = struct {
             .pImageIndices = &self.active_image,
         });
         const started_ns = if (telemetry.enabled()) monotonicNanos() else 0;
+        self.device.mutex.lock();
         const result = self.device.vk.vkQueuePresentKHR(self.device.queue, &info);
+        self.device.mutex.unlock();
         const completed_ns = if (started_ns == 0) 0 else monotonicNanos();
         if (started_ns != 0) {
             telemetry.recordQueuePresent(

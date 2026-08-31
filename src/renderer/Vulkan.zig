@@ -121,10 +121,12 @@ pub const CompletionWorker = struct {
             self.count -= 1;
             self.mutex.unlock();
 
+            var completed_at_ns: u64 = 0;
             if (completion.submitted) {
-                completion.slot.waitAndCleanup() catch |err| {
+                completed_at_ns = completion.slot.waitAndCleanup() catch |err| completed: {
                     log.err("frame completion wait failed err={}", .{err});
                     completion.health = .unhealthy;
+                    break :completed 0;
                 };
             } else {
                 completion.slot.discard();
@@ -133,8 +135,8 @@ pub const CompletionWorker = struct {
             const completion_queue_depth = self.count;
             self.mutex.unlock();
             const completion_duration_ns = if (completion.telemetry_recorded) duration: {
-                const completed_at_ns = vk.monotonicNanos();
                 break :duration if (completion.submitted_at_ns == 0 or
+                    completed_at_ns == 0 or
                     completed_at_ns < completion.submitted_at_ns)
                     0
                 else

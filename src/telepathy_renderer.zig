@@ -30,6 +30,7 @@ const Engine = struct {
     terminal_mutex: std.Thread.Mutex = .{},
     font_library: font.Library,
     font_grid: font.SharedGrid,
+    font_size_pixels: f32,
     renderer: ?GenericRenderer = null,
     telemetry_enabled: bool = false,
 };
@@ -122,8 +123,13 @@ export fn telepathy_ghostty_create(
     engine.font_library = font.Library.init(allocator) catch return null;
     errdefer engine.font_library.deinit();
 
-    engine.font_grid = initFontGrid(engine.font_library) catch return null;
+    const initial_font_size_pixels: f32 = 16;
+    engine.font_grid = initFontGrid(
+        engine.font_library,
+        initial_font_size_pixels,
+    ) catch return null;
     errdefer engine.font_grid.deinit(allocator);
+    engine.font_size_pixels = initial_font_size_pixels;
 
     var config = configpkg.Config.default(allocator) catch return null;
     defer config.deinit();
@@ -187,6 +193,22 @@ export fn telepathy_ghostty_resize(
     const safe_rows: terminalpkg.size.CellCountInt =
         @intCast(@max(1, @min(rows, 4096)));
     value.terminal.resize(allocator, safe_columns, safe_rows) catch return false;
+    return true;
+}
+
+export fn telepathy_ghostty_set_font_size_pixels(
+    engine: ?*Engine,
+    font_size_pixels: f32,
+) bool {
+    const value = engine orelse return false;
+    if (!std.math.isFinite(font_size_pixels) or font_size_pixels <= 0) return false;
+    if (value.renderer != null) return false;
+    if (value.font_size_pixels == font_size_pixels) return true;
+
+    const next_grid = initFontGrid(value.font_library, font_size_pixels) catch return false;
+    value.font_grid.deinit(allocator);
+    value.font_grid = next_grid;
+    value.font_size_pixels = font_size_pixels;
     return true;
 }
 
@@ -307,6 +329,10 @@ export fn telepathy_ghostty_get_performance_metrics(
 
 fn draw(engine: *Engine) bool {
     const active_renderer = if (engine.renderer) |*r| r else return false;
+    if (active_renderer.health.load(.seq_cst) == .unhealthy) {
+        std.log.err("Ghostty renderer is unhealthy", .{});
+        return false;
+    }
     var state: rendererpkg.State = .{
         .mutex = &engine.terminal_mutex,
         .terminal = &engine.terminal,
@@ -359,11 +385,14 @@ fn resizeTerminalForPixels(engine: *Engine, width: u32, height: u32) void {
     _ = telepathy_ghostty_resize(engine, columns, rows);
 }
 
-fn initFontGrid(library: font.Library) !font.SharedGrid {
+fn initFontGrid(library: font.Library, font_size_pixels: f32) !font.SharedGrid {
     const desired_size: font.face.DesiredSize = .{
-        .points = 12,
-        .xdpi = 96,
-        .ydpi = 96,
+        // At 72 DPI Ghostty's point-to-pixel conversion is one-to-one.
+        // Android resolves Telepathy's logical 12sp through scaledDensity and
+        // supplies the resulting physical pixel size at surface attachment.
+        .points = @max(1, @min(font_size_pixels, 512)),
+        .xdpi = 72,
+        .ydpi = 72,
     };
     var collection = font.Collection.init();
     collection.load_options = .{ .library = library, .size = desired_size };

@@ -331,9 +331,9 @@ pub fn complete(self: *const Self) void {
     const d = vk.dev();
     d.vk.vkCmdEndRenderPass(self.cmd);
 
-    // Restore the layout protocol: textures return to
-    // SHADER_READ_ONLY (they'll be sampled by the next pass); targets
-    // go to GENERAL for the external (dmabuf) consumer.
+    // Restore the layout protocol: textures return to SHADER_READ_ONLY
+    // (they'll be sampled by the next pass); Android swapchain targets move
+    // to PRESENT_SRC for WSI presentation.
     switch (self.attachments[0].target) {
         .texture => |t| Texture.barrier(
             self.cmd,

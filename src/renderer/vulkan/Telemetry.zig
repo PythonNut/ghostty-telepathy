@@ -1,7 +1,8 @@
 //! Optional, bounded telemetry for Telepathy's Android Vulkan renderer.
 //!
-//! The hot path performs one relaxed atomic load while telemetry is disabled.
-//! Detailed timing is enabled only by Telepathy's renderer harness.
+//! The hot path performs only inexpensive atomic enabled checks while
+//! telemetry is disabled. Detailed timing is enabled only by Telepathy's
+//! renderer harness.
 const std = @import("std");
 
 pub const Timing = struct {
