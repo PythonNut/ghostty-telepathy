@@ -9,6 +9,7 @@ const font = @import("font/main.zig");
 const rendererpkg = @import("renderer.zig");
 const terminalpkg = @import("terminal/main.zig");
 const AndroidVulkan = @import("renderer/Vulkan.zig");
+const vulkan = @import("renderer/vulkan/vk.zig");
 const android = @cImport({
     @cInclude("android/log.h");
 });
@@ -30,6 +31,7 @@ const Engine = struct {
     font_library: font.Library,
     font_grid: font.SharedGrid,
     renderer: ?GenericRenderer = null,
+    telemetry_enabled: bool = false,
 };
 
 pub const Snapshot = extern struct {
@@ -52,6 +54,37 @@ pub const Cell = extern struct {
     width: u8,
     grapheme_length: u8,
 };
+
+pub const PerformanceMetrics = extern struct {
+    struct_size: u32,
+    flags: u32,
+    model_update_samples: u64,
+    model_update_total_ns: u64,
+    acquire_samples: u64,
+    acquire_total_ns: u64,
+    encode_samples: u64,
+    encode_total_ns: u64,
+    queue_submit_samples: u64,
+    queue_submit_total_ns: u64,
+    queue_present_samples: u64,
+    queue_present_total_ns: u64,
+    gpu_completion_samples: u64,
+    gpu_completion_total_ns: u64,
+    display_samples: u64,
+    display_total_ns: u64,
+    atlas_upload_samples: u64,
+    atlas_upload_total_ns: u64,
+    atlas_upload_bytes: u64,
+    submitted_frames: u64,
+    completed_frames: u64,
+    displayed_frames: u64,
+    in_flight_frames: u64,
+    max_in_flight_frames: u64,
+    completion_queue_depth: u64,
+    max_completion_queue_depth: u64,
+};
+
+const performance_flag_display_timing: u32 = 1 << 0;
 
 const cell_flag_bold: u16 = 1 << 0;
 const cell_flag_italic: u16 = 1 << 1;
@@ -112,6 +145,7 @@ export fn telepathy_ghostty_create(
     engine.render_state = .empty;
     engine.terminal_mutex = .{};
     engine.renderer = null;
+    engine.telemetry_enabled = false;
 
     // Grapheme clustering is opt-in in the terminal protocol. Telepathy uses
     // it by default so combining input and emoji sequences remain atomic.
@@ -187,6 +221,9 @@ export fn telepathy_ghostty_surface_attach(
         .size = size,
         .rt_surface = window,
     }) catch return false;
+    if (value.telemetry_enabled) {
+        value.renderer.?.api.setTelemetryEnabled(true);
+    }
 
     // The owner populates the terminal immediately after attachment and then
     // requests the first frame. Avoid presenting a throwaway blank frame.
@@ -217,16 +254,79 @@ export fn telepathy_ghostty_surface_detach(engine: ?*Engine) void {
     value.renderer = null;
 }
 
+export fn telepathy_ghostty_set_performance_metrics_enabled(
+    engine: ?*Engine,
+    enabled: bool,
+) void {
+    const value = engine orelse return;
+    value.telemetry_enabled = enabled;
+    if (value.renderer) |*active_renderer| {
+        active_renderer.api.setTelemetryEnabled(enabled);
+    }
+}
+
+export fn telepathy_ghostty_get_performance_metrics(
+    engine: ?*Engine,
+    output: ?*PerformanceMetrics,
+) bool {
+    const value = engine orelse return false;
+    const destination = output orelse return false;
+    destination.* = std.mem.zeroes(PerformanceMetrics);
+    destination.struct_size = @sizeOf(PerformanceMetrics);
+    const active_renderer = if (value.renderer) |*renderer| renderer else return true;
+    const snapshot = active_renderer.api.telemetrySnapshot();
+    if (snapshot.display_timing_supported) {
+        destination.flags |= performance_flag_display_timing;
+    }
+    destination.model_update_samples = snapshot.renderer.model_update.samples;
+    destination.model_update_total_ns = snapshot.renderer.model_update.total_ns;
+    destination.acquire_samples = snapshot.renderer.acquire.samples;
+    destination.acquire_total_ns = snapshot.renderer.acquire.total_ns;
+    destination.encode_samples = snapshot.renderer.encode.samples;
+    destination.encode_total_ns = snapshot.renderer.encode.total_ns;
+    destination.queue_submit_samples = snapshot.renderer.queue_submit.samples;
+    destination.queue_submit_total_ns = snapshot.renderer.queue_submit.total_ns;
+    destination.queue_present_samples = snapshot.renderer.queue_present.samples;
+    destination.queue_present_total_ns = snapshot.renderer.queue_present.total_ns;
+    destination.gpu_completion_samples = snapshot.renderer.gpu_completion.samples;
+    destination.gpu_completion_total_ns = snapshot.renderer.gpu_completion.total_ns;
+    destination.display_samples = snapshot.renderer.display.samples;
+    destination.display_total_ns = snapshot.renderer.display.total_ns;
+    destination.atlas_upload_samples = snapshot.device.atlas_upload.samples;
+    destination.atlas_upload_total_ns = snapshot.device.atlas_upload.total_ns;
+    destination.atlas_upload_bytes = snapshot.device.atlas_upload_bytes;
+    destination.submitted_frames = snapshot.renderer.submitted_frames;
+    destination.completed_frames = snapshot.renderer.completed_frames;
+    destination.displayed_frames = snapshot.renderer.displayed_frames;
+    destination.in_flight_frames = snapshot.renderer.in_flight_frames;
+    destination.max_in_flight_frames = snapshot.renderer.max_in_flight_frames;
+    destination.completion_queue_depth = snapshot.renderer.completion_queue_depth;
+    destination.max_completion_queue_depth = snapshot.renderer.max_completion_queue_depth;
+    return true;
+}
+
 fn draw(engine: *Engine) bool {
     const active_renderer = if (engine.renderer) |*r| r else return false;
     var state: rendererpkg.State = .{
         .mutex = &engine.terminal_mutex,
         .terminal = &engine.terminal,
     };
+    const update_started_ns = if (active_renderer.api.telemetry.enabled())
+        vulkan.monotonicNanos()
+    else
+        0;
     active_renderer.updateFrame(&state, true) catch |err| {
         std.log.err("Ghostty frame update failed: {}", .{err});
         return false;
     };
+    if (update_started_ns != 0) {
+        const update_completed_ns = vulkan.monotonicNanos();
+        if (update_completed_ns >= update_started_ns) {
+            active_renderer.api.telemetry.recordModelUpdate(
+                update_completed_ns - update_started_ns,
+            );
+        }
+    }
     active_renderer.drawFrame(false) catch |err| {
         std.log.err("Ghostty frame draw failed: {}", .{err});
         return false;

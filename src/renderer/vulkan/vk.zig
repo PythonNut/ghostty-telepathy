@@ -16,6 +16,7 @@
 //! queue submissions and shared caches.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Telemetry = @import("Telemetry.zig");
 
 const log = std.log.scoped(.vulkan);
 
@@ -24,7 +25,37 @@ pub const c = @cImport({
     @cDefine("VK_USE_PLATFORM_ANDROID_KHR", "1");
     @cInclude("vulkan/vulkan.h");
     @cInclude("android/native_window.h");
+    @cInclude("time.h");
 });
+
+var device_telemetry: Telemetry.DeviceTelemetry = .{};
+
+pub fn monotonicNanos() u64 {
+    var timestamp: c.timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_MONOTONIC, &timestamp) != 0) return 0;
+    return @as(u64, @intCast(timestamp.tv_sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(timestamp.tv_nsec));
+}
+
+pub fn deviceTelemetryEnable() void {
+    device_telemetry.enable();
+}
+
+pub fn deviceTelemetryDisable() void {
+    device_telemetry.disable();
+}
+
+pub fn deviceTelemetryEnabled() bool {
+    return device_telemetry.enabled();
+}
+
+pub fn recordAtlasUpload(bytes: usize, duration_ns: u64) void {
+    device_telemetry.recordAtlasUpload(bytes, duration_ns);
+}
+
+pub fn deviceTelemetrySnapshot() Telemetry.DeviceSnapshot {
+    return device_telemetry.snapshot();
+}
 
 /// Draw primitive topology (subset generic.zig uses).
 pub const Primitive = enum {
@@ -177,6 +208,7 @@ const DeviceDispatch = struct {
 const ExtDispatch = struct {
     vkGetImageDrmFormatModifierPropertiesEXT: ?Pfn("vkGetImageDrmFormatModifierPropertiesEXT") = null,
     vkGetMemoryFdKHR: ?Pfn("vkGetMemoryFdKHR") = null,
+    vkGetPastPresentationTimingGOOGLE: ?Pfn("vkGetPastPresentationTimingGOOGLE") = null,
 };
 
 /// The color formats we may render to. Used to key render pass /
@@ -314,6 +346,9 @@ pub const Device = struct {
     /// path for dmabuf-exported targets). If false we fall back to
     /// VK_IMAGE_TILING_LINEAR export, which Mesa accepts in practice.
     has_modifiers: bool,
+
+    /// Optional Android presentation timestamps from VK_GOOGLE_display_timing.
+    has_display_timing: bool,
 
     /// Command pool + buffer + fence for immediate (staging) submissions.
     imm_pool: c.VkCommandPool,
@@ -474,6 +509,7 @@ pub const Device = struct {
         defer alloc.free(exts);
         try check(vki.vkEnumerateDeviceExtensionProperties(phys, null, &ext_count, exts.ptr));
         var missing_required = false;
+        var has_display_timing = false;
         for (required_exts) |want| {
             var found = false;
             for (exts) |e| {
@@ -489,6 +525,16 @@ pub const Device = struct {
             }
         }
         if (missing_required) return error.VulkanUnavailable;
+        for (exts) |e| {
+            if (std.mem.eql(
+                u8,
+                std.mem.sliceTo(&e.extensionName, 0),
+                std.mem.sliceTo(c.VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME, 0),
+            )) {
+                has_display_timing = true;
+                break;
+            }
+        }
 
         // Device.
         const prio: f32 = 1.0;
@@ -498,18 +544,38 @@ pub const Device = struct {
             .queueCount = 1,
             .pQueuePriorities = &prio,
         });
+        var enabled_exts: [2][*:0]const u8 = undefined;
+        enabled_exts[0] = c.VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+        var enabled_ext_count: u32 = 1;
+        if (has_display_timing) {
+            enabled_exts[enabled_ext_count] = c.VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
+            enabled_ext_count += 1;
+        }
         const dci = std.mem.zeroInit(c.VkDeviceCreateInfo, .{
             .sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &qci,
-            .enabledExtensionCount = required_exts.len,
-            .ppEnabledExtensionNames = &required_exts,
+            .enabledExtensionCount = enabled_ext_count,
+            .ppEnabledExtensionNames = &enabled_exts,
         });
         var device: c.VkDevice = null;
         try check(vki.vkCreateDevice(phys, &dci, null, &device));
 
         const vk = try loadDeviceDispatch(vki.vkGetDeviceProcAddr, device);
         errdefer vk.vkDestroyDevice(device, null);
+
+        var ext_dispatch: ExtDispatch = .{};
+        if (has_display_timing) {
+            const entry = vki.vkGetDeviceProcAddr(
+                device,
+                "vkGetPastPresentationTimingGOOGLE",
+            );
+            if (entry) |function| {
+                ext_dispatch.vkGetPastPresentationTimingGOOGLE = @ptrCast(function);
+            } else {
+                has_display_timing = false;
+            }
+        }
 
         var queue: c.VkQueue = null;
         vk.vkGetDeviceQueue(device, qfi, 0, &queue);
@@ -608,7 +674,7 @@ pub const Device = struct {
             .vkg = vkg,
             .vki = vki,
             .vk = vk,
-            .ext = .{},
+            .ext = ext_dispatch,
             .instance = instance,
             .phys = phys,
             .props = props,
@@ -617,6 +683,7 @@ pub const Device = struct {
             .queue_family = qfi,
             .queue = queue,
             .has_modifiers = false,
+            .has_display_timing = has_display_timing,
             .imm_pool = imm_pool,
             .imm_cmd = imm_cmd,
             .imm_fence = imm_fence,
@@ -1007,6 +1074,12 @@ pub fn deferBufferDestroy(buffer: PendingBuffer) void {
     device.vk.vkFreeMemory(device.device, buffer.memory, null);
 }
 
+const PresentationStamp = struct {
+    present_id: u32 = 0,
+    queue_present_ns: u64 = 0,
+    valid: bool = false,
+};
+
 /// Android presentation state. Ghostty's generic renderer rotates logical
 /// frame resources; Android's compositor owns the actual presentable images.
 /// A Target is therefore populated with the image acquired here at frame
@@ -1026,6 +1099,8 @@ pub const Surface = struct {
     requested_height: u32,
     active_image: u32 = 0,
     needs_recreate: bool = false,
+    next_present_id: u32 = 1,
+    presentation_stamps: [64]PresentationStamp = [_]PresentationStamp{.{}} ** 64,
 
     pub fn init(
         alloc: Allocator,
@@ -1376,17 +1451,96 @@ pub const Surface = struct {
         return error.VulkanFailed;
     }
 
-    pub fn present(self: *Surface) Error!void {
+    pub fn displayTimingSupported(self: *const Surface) bool {
+        return self.device.has_display_timing and
+            self.device.ext.vkGetPastPresentationTimingGOOGLE != null;
+    }
+
+    pub fn collectPastPresentationTimings(
+        self: *Surface,
+        telemetry: *Telemetry.Telemetry,
+    ) void {
+        const get_timings = self.device.ext.vkGetPastPresentationTimingGOOGLE orelse return;
+        if (self.swapchain == null) return;
+
+        var available: u32 = 0;
+        if (get_timings(
+            self.device.device,
+            self.swapchain,
+            &available,
+            null,
+        ) != c.VK_SUCCESS or available == 0) return;
+
+        var timings: [64]c.VkPastPresentationTimingGOOGLE = undefined;
+        var count: u32 = @min(available, timings.len);
+        const result = get_timings(
+            self.device.device,
+            self.swapchain,
+            &count,
+            &timings,
+        );
+        if (result != c.VK_SUCCESS and result != c.VK_INCOMPLETE) return;
+
+        for (timings[0..count]) |timing| {
+            const index = timing.presentID % self.presentation_stamps.len;
+            const stamp = &self.presentation_stamps[index];
+            if (!stamp.valid or stamp.present_id != timing.presentID) continue;
+            stamp.valid = false;
+            if (timing.actualPresentTime >= stamp.queue_present_ns) {
+                telemetry.recordDisplay(timing.actualPresentTime - stamp.queue_present_ns);
+            }
+        }
+    }
+
+    pub fn present(
+        self: *Surface,
+        telemetry: *Telemetry.Telemetry,
+    ) Error!void {
+        if (self.displayTimingSupported()) {
+            self.collectPastPresentationTimings(telemetry);
+        }
+
         const render_finished = self.render_finished.items[self.active_image];
+        const timing_enabled = self.displayTimingSupported() and telemetry.enabled();
+        const present_id = self.next_present_id;
+        var present_time = c.VkPresentTimeGOOGLE{
+            .presentID = present_id,
+            .desiredPresentTime = 0,
+        };
+        var present_times_info = std.mem.zeroInit(c.VkPresentTimesInfoGOOGLE, .{
+            .sType = c.VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE,
+            .swapchainCount = 1,
+            .pTimes = &present_time,
+        });
         const info = std.mem.zeroInit(c.VkPresentInfoKHR, .{
             .sType = c.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = if (timing_enabled) &present_times_info else null,
             .waitSemaphoreCount = 1,
             .pWaitSemaphores = &render_finished,
             .swapchainCount = 1,
             .pSwapchains = &self.swapchain,
             .pImageIndices = &self.active_image,
         });
+        const started_ns = if (telemetry.enabled()) monotonicNanos() else 0;
         const result = self.device.vk.vkQueuePresentKHR(self.device.queue, &info);
+        const completed_ns = if (started_ns == 0) 0 else monotonicNanos();
+        if (started_ns != 0) {
+            telemetry.recordQueuePresent(
+                if (completed_ns >= started_ns) completed_ns - started_ns else 0,
+            );
+        }
+        if (timing_enabled and
+            (result == c.VK_SUCCESS or result == c.VK_SUBOPTIMAL_KHR))
+        {
+            const index = present_id % self.presentation_stamps.len;
+            self.presentation_stamps[index] = .{
+                .present_id = present_id,
+                .queue_present_ns = completed_ns,
+                .valid = true,
+            };
+            self.next_present_id +%= 1;
+            if (self.next_present_id == 0) self.next_present_id = 1;
+        }
         if (result == c.VK_ERROR_OUT_OF_DATE_KHR) {
             self.needs_recreate = true;
             return;

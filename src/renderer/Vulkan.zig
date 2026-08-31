@@ -21,6 +21,7 @@ const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(Vulkan);
+const telemetrypkg = @import("vulkan/Telemetry.zig");
 
 pub const GraphicsAPI = Vulkan;
 pub const Target = @import("vulkan/Target.zig");
@@ -56,6 +57,8 @@ pub const Completion = struct {
     slot: *vk.FrameSlot,
     health: rendererpkg.Health,
     submitted: bool,
+    submitted_at_ns: u64 = 0,
+    telemetry_recorded: bool = false,
     sync: ?*std.Thread.Semaphore = null,
 };
 
@@ -94,8 +97,12 @@ pub const CompletionWorker = struct {
         defer self.mutex.unlock();
         std.debug.assert(self.count < self.entries.len);
         const tail = (self.head + self.count) % self.entries.len;
-        self.entries[tail] = completion;
+        var entry = completion;
         self.count += 1;
+        if (entry.submitted) {
+            entry.telemetry_recorded = entry.renderer.api.telemetry.frameSubmitted(self.count);
+        }
+        self.entries[tail] = entry;
         self.condition.signal();
     }
 
@@ -122,6 +129,22 @@ pub const CompletionWorker = struct {
             } else {
                 completion.slot.discard();
             }
+            self.mutex.lock();
+            const completion_queue_depth = self.count;
+            self.mutex.unlock();
+            const completion_duration_ns = if (completion.telemetry_recorded) duration: {
+                const completed_at_ns = vk.monotonicNanos();
+                break :duration if (completion.submitted_at_ns == 0 or
+                    completed_at_ns < completion.submitted_at_ns)
+                    0
+                else
+                    completed_at_ns - completion.submitted_at_ns;
+            } else 0;
+            completion.renderer.api.telemetry.frameCompleted(
+                completion_duration_ns,
+                completion_queue_depth,
+                completion.telemetry_recorded,
+            );
             completion.renderer.frameCompleted(completion.health);
             if (completion.sync) |semaphore| semaphore.post();
         }
@@ -150,6 +173,10 @@ size: struct { width: u32, height: u32 },
 
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
+
+/// Detailed instrumentation enabled only by Telepathy's renderer harness.
+telemetry: telemetrypkg.Telemetry = .{},
+device_telemetry_enabled: bool = false,
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Vulkan {
     const window: *vk.c.ANativeWindow = @ptrCast(@alignCast(opts.rt_surface));
@@ -183,6 +210,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Vulkan {
 
 pub fn deinit(self: *Vulkan) void {
     self.completion.deinit();
+    if (self.device_telemetry_enabled) vk.deviceTelemetryDisable();
     self.presentation.deinit();
     self.frames.deinit();
     vk.deviceUnref();
@@ -241,6 +269,38 @@ pub fn drawFrameEnd(self: *Vulkan) void {
     _ = self;
 }
 
+pub const TelemetrySnapshot = struct {
+    renderer: telemetrypkg.Snapshot,
+    device: telemetrypkg.DeviceSnapshot,
+    display_timing_supported: bool,
+};
+
+pub fn setTelemetryEnabled(self: *Vulkan, enabled: bool) void {
+    if (self.telemetry.enabled() == enabled) return;
+    if (enabled) {
+        vk.deviceTelemetryEnable();
+        self.device_telemetry_enabled = true;
+        self.telemetry.setEnabled(true);
+    } else {
+        self.telemetry.setEnabled(false);
+        if (self.device_telemetry_enabled) {
+            vk.deviceTelemetryDisable();
+            self.device_telemetry_enabled = false;
+        }
+    }
+}
+
+pub fn telemetrySnapshot(self: *Vulkan) TelemetrySnapshot {
+    if (self.presentation.displayTimingSupported()) {
+        self.presentation.collectPastPresentationTimings(&self.telemetry);
+    }
+    return .{
+        .renderer = self.telemetry.snapshot(),
+        .device = vk.deviceTelemetrySnapshot(),
+        .display_timing_supported = self.presentation.displayTimingSupported(),
+    };
+}
+
 pub fn initShaders(
     self: *const Vulkan,
     alloc: Allocator,
@@ -270,7 +330,7 @@ pub fn initTarget(self: *const Vulkan, width: usize, height: usize) !Target {
 /// Present the provided target: dup the exported dmabuf fd and hand it
 /// to the GTK apprt (main thread) to wrap in a GdkDmabufTexture.
 pub fn present(self: *Vulkan, target: Target) !void {
-    try self.presentation.present();
+    try self.presentation.present(&self.telemetry);
     self.last_target = target;
 }
 
@@ -423,6 +483,12 @@ pub inline fn beginFrame(
     const slot = self.frames.next();
     var frame = try Frame.begin(.{ .slot = slot }, renderer, target);
     errdefer frame.cancel();
+    const acquire_started_ns = if (self.telemetry.enabled()) vk.monotonicNanos() else 0;
     try self.presentation.acquire(target, slot.image_available);
+    const acquired_ns = if (acquire_started_ns == 0) 0 else vk.monotonicNanos();
+    if (acquire_started_ns != 0 and acquired_ns >= acquire_started_ns) {
+        self.telemetry.recordAcquire(acquired_ns - acquire_started_ns);
+    }
+    frame.encoding_started_ns = acquired_ns;
     return frame;
 }

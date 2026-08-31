@@ -29,6 +29,7 @@ renderer: *Renderer,
 target: *Target,
 slot: *vk.FrameSlot,
 cmd: c.VkCommandBuffer,
+encoding_started_ns: u64 = 0,
 
 /// Begin encoding a frame.
 pub fn begin(
@@ -75,10 +76,20 @@ pub inline fn renderPass(
 pub fn complete(self: *const Self, sync: bool) void {
     vk.clearRecordingSlot(self.slot);
 
+    if (self.encoding_started_ns != 0) {
+        const encoding_completed_ns = vk.monotonicNanos();
+        if (encoding_completed_ns >= self.encoding_started_ns) {
+            self.renderer.api.telemetry.recordEncode(
+                encoding_completed_ns - self.encoding_started_ns,
+            );
+        }
+    }
+
     var health: Health = .healthy;
-    self.submit() catch |err| {
+    const submitted_at_ns = self.submit() catch |err| submitted: {
         log.err("frame submission failed err={}", .{err});
         health = .unhealthy;
+        break :submitted 0;
     };
     const submitted = health == .healthy;
 
@@ -100,15 +111,17 @@ pub fn complete(self: *const Self, sync: bool) void {
         .slot = self.slot,
         .health = health,
         .submitted = submitted,
+        .submitted_at_ns = submitted_at_ns,
         .sync = if (sync) &sync_semaphore else null,
     });
     if (sync) sync_semaphore.wait();
 }
 
-fn submit(self: *const Self) vk.Error!void {
+fn submit(self: *const Self) vk.Error!u64 {
     const d = vk.dev();
     try vk.check(d.vk.vkEndCommandBuffer(self.cmd));
 
+    const started_ns = if (self.renderer.api.telemetry.enabled()) vk.monotonicNanos() else 0;
     d.mutex.lock();
     defer d.mutex.unlock();
 
@@ -127,5 +140,11 @@ fn submit(self: *const Self) vk.Error!void {
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &render_finished,
     });
-    try vk.check(d.vk.vkQueueSubmit(d.queue, 1, &si, self.slot.fence));
+    const result = d.vk.vkQueueSubmit(d.queue, 1, &si, self.slot.fence);
+    const completed_ns = if (started_ns == 0) 0 else vk.monotonicNanos();
+    if (started_ns != 0 and completed_ns >= started_ns) {
+        self.renderer.api.telemetry.recordQueueSubmit(completed_ns - started_ns);
+    }
+    try vk.check(result);
+    return completed_ns;
 }

@@ -310,6 +310,12 @@ fn replaceRegionInternal(
     // Staging buffer.
     const size = width * height * self.format.bytesPerPixel();
     const upload = @min(size, data.len);
+    const telemetry_enabled = vk.deviceTelemetryEnabled();
+    const telemetry_started = if (telemetry_enabled) vk.monotonicNanos() else 0;
+    defer if (telemetry_enabled) vk.recordAtlasUpload(
+        upload,
+        vk.monotonicNanos() - telemetry_started,
+    );
     const bci = std.mem.zeroInit(c.VkBufferCreateInfo, .{
         .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = @max(upload, 4),
