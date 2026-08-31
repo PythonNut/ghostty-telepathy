@@ -7,6 +7,7 @@ const std = @import("std");
 const configpkg = @import("config.zig");
 const font = @import("font/main.zig");
 const rendererpkg = @import("renderer.zig");
+const telepathy_input = @import("telepathy_input.zig");
 const terminalpkg = @import("terminal/main.zig");
 const AndroidVulkan = @import("renderer/Vulkan.zig");
 const vulkan = @import("renderer/vulkan/vk.zig");
@@ -180,6 +181,73 @@ export fn telepathy_ghostty_write(
     if (length == 0) return true;
     const data = bytes orelse return false;
     value.stream.nextSlice(data[0..length]) catch return false;
+    return true;
+}
+
+export fn telepathy_ghostty_encode_key(
+    engine: ?*Engine,
+    key_code: ?[*]const u8,
+    key_code_length: usize,
+    action: u32,
+    modifiers: u32,
+    consumed_modifiers: u32,
+    text: ?[*]const u8,
+    text_length: usize,
+    unshifted_codepoint: u32,
+    output: ?[*]u8,
+    output_capacity: usize,
+    output_length: ?*usize,
+) bool {
+    const value = engine orelse return false;
+    const destination_length = output_length orelse return false;
+    const code = if (key_code) |data| data[0..key_code_length] else return false;
+    const utf8 = if (text) |data| data[0..text_length] else if (text_length == 0) "" else return false;
+    const destination = if (output) |data| data[0..output_capacity] else null;
+    return telepathy_input.encodeKey(
+        &value.terminal,
+        code,
+        action,
+        modifiers,
+        consumed_modifiers,
+        utf8,
+        unshifted_codepoint,
+        destination,
+        destination_length,
+    );
+}
+
+export fn telepathy_ghostty_encode_text(
+    engine: ?*Engine,
+    text: ?[*]const u8,
+    text_length: usize,
+    output: ?[*]u8,
+    output_capacity: usize,
+    output_length: ?*usize,
+) bool {
+    const value = engine orelse return false;
+    const destination_length = output_length orelse return false;
+    const utf8 = if (text) |data| data[0..text_length] else if (text_length == 0) "" else return false;
+    const destination = if (output) |data| data[0..output_capacity] else null;
+    return telepathy_input.encodeText(
+        &value.terminal,
+        utf8,
+        destination,
+        destination_length,
+    );
+}
+
+export fn telepathy_ghostty_get_size(
+    engine: ?*Engine,
+    columns: ?*u32,
+    rows: ?*u32,
+    width_pixels: ?*u32,
+    height_pixels: ?*u32,
+) bool {
+    const value = engine orelse return false;
+    (columns orelse return false).* = value.terminal.cols;
+    (rows orelse return false).* = value.terminal.rows;
+    (width_pixels orelse return false).* = value.terminal.width_px;
+    (height_pixels orelse return false).* = value.terminal.height_px;
     return true;
 }
 
@@ -384,6 +452,8 @@ fn resizeTerminalForPixels(engine: *Engine, width: u32, height: u32) void {
     const columns: u32 = @max(1, width / @max(1, cell.width));
     const rows: u32 = @max(1, height / @max(1, cell.height));
     _ = telepathy_ghostty_resize(engine, columns, rows);
+    engine.terminal.width_px = width;
+    engine.terminal.height_px = height;
 }
 
 fn initFontGrid(library: font.Library, font_size_pixels: f32) !font.SharedGrid {

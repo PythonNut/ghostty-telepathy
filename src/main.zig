@@ -23,4 +23,5 @@ else
 
 test {
     _ = entrypoint;
+    _ = @import("telepathy_input.zig");
 }
