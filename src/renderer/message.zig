@@ -1,10 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
 const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
 const renderer = @import("../renderer.zig");
-const terminal = @import("../terminal/main.zig");
 
 /// The messages that can be sent to a renderer thread.
 pub const Message = union(enum) {
@@ -67,15 +65,8 @@ pub const Message = union(enum) {
     /// The macOS display ID has changed for the window.
     macos_display_id: u32,
 
-    pub const SearchMatches = struct {
-        arena: ArenaAllocator,
-        matches: []const terminal.highlight.Flattened,
-    };
-
-    pub const SearchMatch = struct {
-        arena: ArenaAllocator,
-        match: terminal.highlight.Flattened,
-    };
+    pub const SearchMatches = renderer.SearchMatches;
+    pub const SearchMatch = renderer.SearchMatch;
 
     /// Initialize a change_config message.
     pub fn initChangeConfig(alloc: Allocator, config: *const configpkg.Config) !Message {

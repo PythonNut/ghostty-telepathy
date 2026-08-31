@@ -17,11 +17,14 @@ pub const Backend = @import("renderer/backend.zig").Backend;
 pub const GenericRenderer = @import("renderer/generic.zig").Renderer;
 pub const Metal = @import("renderer/Metal.zig");
 pub const OpenGL = @import("renderer/OpenGL.zig");
+pub const Vulkan = @import("renderer/Vulkan.zig");
 pub const WebGL = @import("renderer/WebGL.zig");
 pub const Options = @import("renderer/Options.zig");
 pub const Overlay = @import("renderer/Overlay.zig");
 pub const Thread = @import("renderer/Thread.zig");
 pub const State = @import("renderer/State.zig");
+pub const SearchMatches = @import("renderer/search.zig").Matches;
+pub const SearchMatch = @import("renderer/search.zig").Match;
 pub const CursorStyle = cursor.Style;
 pub const Message = message.Message;
 pub const Size = size.Size;
@@ -38,6 +41,7 @@ pub const lib = @import("lib/main.zig");
 pub const Renderer = switch (build_config.renderer) {
     .metal => GenericRenderer(Metal),
     .opengl => GenericRenderer(OpenGL),
+    .vulkan => GenericRenderer(Vulkan),
     .webgl => WebGL,
 };
 

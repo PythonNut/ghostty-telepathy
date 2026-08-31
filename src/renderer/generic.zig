@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("xev");
 const wuffs = @import("wuffs");
-const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
 const inputpkg = @import("../input.zig");
@@ -10,7 +9,6 @@ const os = @import("../os/main.zig");
 const terminal = @import("../terminal/main.zig");
 const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
-const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
 const noMinContrast = cellpkg.noMinContrast;
@@ -104,7 +102,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         config: DerivedConfig,
 
         /// The mailbox for communicating with the window.
-        surface_mailbox: apprt.surface.Mailbox,
+        surface_mailbox: renderer.Options.SurfaceMailbox,
 
         /// Current font metrics defining our grid.
         grid_metrics: font.Metrics,
@@ -138,8 +136,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Note that the selections MAY BE INVALID (point to PageList nodes
         /// that do not exist anymore). These must be validated prior to use.
-        search_matches: ?renderer.Message.SearchMatches,
-        search_selected_match: ?renderer.Message.SearchMatch,
+        search_matches: ?renderer.SearchMatches,
+        search_selected_match: ?renderer.SearchMatch,
         search_matches_dirty: bool,
 
         /// The current set of cells to render. This is rebuilt on every frame
@@ -839,14 +837,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const arena_alloc = arena.allocator();
 
             // Load our custom shaders
-            const custom_shaders: []const [:0]const u8 = shadertoy.loadFromFiles(
-                arena_alloc,
-                self.config.custom_shaders,
-                GraphicsAPI.custom_shader_target,
-            ) catch |err| err: {
-                log.warn("error loading custom shaders err={}", .{err});
-                break :err &.{};
-            };
+            const custom_shaders: []const [:0]const u8 = if (comptime
+                @hasDecl(GraphicsAPI, "standalone") and GraphicsAPI.standalone)
+                &.{}
+            else
+                shadertoy.loadFromFiles(
+                    arena_alloc,
+                    self.config.custom_shaders,
+                    GraphicsAPI.custom_shader_target,
+                ) catch |err| err: {
+                    log.warn("error loading custom shaders err={}", .{err});
+                    break :err &.{};
+                };
 
             const has_custom_shaders = custom_shaders.len > 0;
 
@@ -861,7 +863,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// This is called early right after surface creation.
-        pub fn surfaceInit(surface: *apprt.Surface) !void {
+        pub fn surfaceInit(surface: *anyopaque) !void {
             // If our API has to do things here, let it.
             if (@hasDecl(GraphicsAPI, "surfaceInit")) {
                 try GraphicsAPI.surfaceInit(surface);
@@ -870,7 +872,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// This is called just prior to spinning up the renderer thread for
         /// final main thread setup requirements.
-        pub fn finalizeSurfaceInit(self: *Self, surface: *apprt.Surface) !void {
+        pub fn finalizeSurfaceInit(self: *Self, surface: *anyopaque) !void {
             // If our API has to do things to finalize surface init, let it.
             if (@hasDecl(GraphicsAPI, "finalizeSurfaceInit")) {
                 try self.api.finalizeSurfaceInit(surface);
@@ -878,7 +880,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Callback called by renderer.Thread when it begins.
-        pub fn threadEnter(self: *const Self, surface: *apprt.Surface) !void {
+        pub fn threadEnter(self: *const Self, surface: *anyopaque) !void {
             // If our API has to do things on thread enter, let it.
             if (@hasDecl(GraphicsAPI, "threadEnter")) {
                 try self.api.threadEnter(surface);
@@ -1262,13 +1264,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
-                const overlay_features: []const Overlay.Feature = overlay: {
-                    const insp = state.inspector orelse break :overlay &.{};
-                    const renderer_info = insp.rendererInfo();
-                    break :overlay renderer_info.overlayFeatures(
-                        arena_alloc,
-                    ) catch &.{};
-                };
+                // The Telepathy artifact intentionally excludes Ghostty's
+                // desktop inspector. Its renderer overlay is an application
+                // debugging feature rather than terminal presentation state.
+                const overlay_features: []const Overlay.Feature = &.{};
 
                 break :critical .{
                     .links = links,
@@ -1550,19 +1549,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             _ = self.images.upload(self.alloc, &self.api);
 
             // Upload the background image to the GPU as necessary.
-            try self.uploadBackgroundImage();
+            self.uploadBackgroundImage() catch |err| {
+                log.err("background image upload failed: {}", .{err});
+                return err;
+            };
 
             // Update per-frame custom shader uniforms.
-            try self.updateCustomShaderUniformsForFrame();
+            self.updateCustomShaderUniformsForFrame() catch |err| {
+                log.err("custom shader uniform update failed: {}", .{err});
+                return err;
+            };
 
             // Setup our frame data
-            try frame.uniforms.sync(&.{self.uniforms});
-            try frame.cells_bg.sync(self.cells.bg_cells);
-            const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
-
+            frame.uniforms.sync(&.{self.uniforms}) catch |err| {
+                log.err("frame uniform sync failed: {}", .{err});
+                return err;
+            };
+            frame.cells_bg.sync(self.cells.bg_cells) catch |err| {
+                log.err("background cell sync failed: {}", .{err});
+                return err;
+            };
+            const fg_count = frame.cells.syncFromArrayLists(
+                self.cells.fg_rows.lists,
+            ) catch |err| {
+                log.err("foreground cell sync failed: {}", .{err});
+                return err;
+            };
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
-                try frame.bg_image_buffer.sync(&.{self.bg_image_buffer});
+                frame.bg_image_buffer.sync(&.{self.bg_image_buffer}) catch |err| {
+                    log.err("background image buffer sync failed: {}", .{err});
+                    return err;
+                };
 
                 frame.bg_image_buffer_modified = self.bg_image_buffer_modified;
             }
@@ -1574,7 +1592,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.font_grid.lock.lockShared();
                 defer self.font_grid.lock.unlockShared();
                 frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
-                try self.syncAtlasTexture(&self.font_grid.atlas_grayscale, &frame.grayscale);
+                self.syncAtlasTexture(
+                    &self.font_grid.atlas_grayscale,
+                    &frame.grayscale,
+                ) catch |err| {
+                    log.err("grayscale atlas sync failed: {}", .{err});
+                    return err;
+                };
             }
             texture: {
                 const modified = self.font_grid.atlas_color.modified.load(.monotonic);
@@ -1582,11 +1606,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.font_grid.lock.lockShared();
                 defer self.font_grid.lock.unlockShared();
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
-                try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
+                self.syncAtlasTexture(
+                    &self.font_grid.atlas_color,
+                    &frame.color,
+                ) catch |err| {
+                    log.err("color atlas sync failed: {}", .{err});
+                    return err;
+                };
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
+            var frame_ctx = self.api.beginFrame(self, &frame.target) catch |err| {
+                log.err("graphics frame begin failed: {}", .{err});
+                return err;
+            };
             defer frame_ctx.complete(sync);
 
             {

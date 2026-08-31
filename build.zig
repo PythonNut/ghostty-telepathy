@@ -33,6 +33,25 @@ pub fn build(b: *std.Build) !void {
         &deps,
     );
 
+    // Telepathy's Android renderer prototype is intentionally a separate
+    // artifact from libghostty. It reuses Ghostty's terminal, font, and
+    // generic renderer layers without pulling in a desktop application
+    // runtime, PTY owner, inspector, or shader compiler.
+    const telepathy_renderer = try buildpkg.GhosttyTelepathyRenderer.init(b, &deps);
+    const telepathy_renderer_step = b.step(
+        "telepathy-renderer",
+        "Build Telepathy's narrow Android Ghostty renderer artifact",
+    );
+    const install_telepathy_renderer = b.addInstallArtifact(
+        telepathy_renderer.library,
+        .{},
+    );
+    telepathy_renderer_step.dependOn(&install_telepathy_renderer.step);
+    for (telepathy_renderer.link_libraries) |link_library| {
+        const install_link_library = b.addInstallArtifact(link_library, .{});
+        telepathy_renderer_step.dependOn(&install_link_library.step);
+    }
+
     // All our steps which we'll hook up later. The steps are shown
     // up here just so that they are more self-documenting.
     const libvt_step = b.step("lib-vt", "Build libghostty-vt");

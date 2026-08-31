@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
@@ -18,7 +17,7 @@ terminal: *terminalpkg.Terminal,
 
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
-inspector: ?*Inspector = null,
+inspector: ?*anyopaque = null,
 
 /// Dead key state. This will render the current dead key preedit text
 /// over the cursor. This currently only ever renders a single codepoint.

@@ -6,6 +6,8 @@ pub const Backend = enum {
     opengl,
     metal,
     webgl,
+    /// Vulkan skeleton backend (feasibility prototype, Linux only).
+    vulkan,
 
     pub fn default(
         target: std.Target,
