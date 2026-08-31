@@ -43,6 +43,11 @@ styles: StyleStatus = .initFill(true),
 /// the codepoint. This can be set after initialization.
 discover: ?*Discover = null,
 
+/// Optional host-provided fallback loader. This supports platforms whose
+/// native font matcher can locate a face for a codepoint but cannot cheaply
+/// enumerate deferred faces (Android is one example).
+dynamic_fallback: ?DynamicFallback = null,
+
 /// A map of codepoints to font requests for codepoint-level overrides.
 /// The memory associated with the map is owned by the caller and is not
 /// modified or freed by Group.
@@ -57,6 +62,17 @@ descriptor_cache: DescriptorCache = .{},
 /// to render sprite glyphs. But more than likely, if this isn't set then
 /// terminal rendering will look wrong.
 sprite: ?SpriteFace = null,
+
+pub const DynamicFallback = struct {
+    context: ?*anyopaque = null,
+    load: *const fn (
+        context: ?*anyopaque,
+        cp: u32,
+        style: Style,
+        presentation: ?Presentation,
+        options: Collection.LoadOptions,
+    ) ?Face,
+};
 
 pub fn deinit(self: *CodepointResolver, alloc: Allocator) void {
     self.collection.deinit(alloc);
@@ -216,6 +232,45 @@ pub fn getIndex(
 
             log.debug("no fallback face found for cp={X}", .{cp});
         }
+    }
+
+    // Some hosts expose a direct text-to-font matcher instead of a font
+    // discovery database. Ask it only after the normal collection and
+    // discovery paths fail, then retain the loaded face in the collection.
+    if (style == .regular) dynamic: {
+        const fallback = self.dynamic_fallback orelse break :dynamic;
+        const load_opts = self.collection.load_options orelse break :dynamic;
+        const presentation: ?Presentation = switch (p_mode) {
+            .default, .explicit => |value| value,
+            .any => null,
+        };
+        var face = fallback.load(
+            fallback.context,
+            cp,
+            style,
+            presentation,
+            load_opts,
+        ) orelse break :dynamic;
+
+        // Native matchers are permitted to return their tofu face when no
+        // real match exists, so verify both the glyph and presentation.
+        const entry: Collection.Entry = .{
+            .face = .{ .loaded = face },
+            .fallback = true,
+        };
+        if (!entry.hasCodepoint(cp, p_mode)) {
+            face.deinit();
+            break :dynamic;
+        }
+
+        return self.collection.add(alloc, face, .{
+            .style = style,
+            .fallback = true,
+            .size_adjustment = font.default_fallback_adjustment,
+        }) catch {
+            face.deinit();
+            break :dynamic;
+        };
     }
 
     // If this is regular with any matching presentation, then we are done
@@ -530,6 +585,57 @@ test "getIndex disabled font style" {
         try testing.expectEqual(Style.italic, idx.style);
         try testing.expectEqual(@as(Collection.Index.IndexInt, 0), idx.idx);
     }
+}
+
+test "getIndex dynamic fallback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var c = Collection.init();
+    c.load_options = .{ .library = lib };
+    _ = try c.add(alloc, try .init(
+        lib,
+        font.embedded.symbols_nerd_font,
+        .{ .size = .{ .points = 12 } },
+    ), .{
+        .style = .regular,
+        .fallback = false,
+        .size_adjustment = .none,
+    });
+
+    const Fallback = struct {
+        fn load(
+            context: ?*anyopaque,
+            cp: u32,
+            style: Style,
+            presentation: ?Presentation,
+            options: Collection.LoadOptions,
+        ) ?Face {
+            _ = context;
+            _ = style;
+            _ = presentation;
+            if (cp != 'A') return null;
+            return Face.init(
+                options.library,
+                font.embedded.regular,
+                options.faceOptions(),
+            ) catch null;
+        }
+    };
+
+    var r: CodepointResolver = .{
+        .collection = c,
+        .dynamic_fallback = .{ .load = Fallback.load },
+    };
+    defer r.deinit(alloc);
+
+    const idx = r.getIndex(alloc, 'A', .regular, .text).?;
+    try testing.expectEqual(Style.regular, idx.style);
+    try testing.expectEqual(@as(Collection.Index.IndexInt, 1), idx.idx);
+    try testing.expect(r.getIndex(alloc, 0x1FB00, .regular, null) == null);
 }
 
 test "getIndex box glyph" {

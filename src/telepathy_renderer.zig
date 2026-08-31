@@ -12,6 +12,7 @@ const AndroidVulkan = @import("renderer/Vulkan.zig");
 const vulkan = @import("renderer/vulkan/vk.zig");
 const android = @cImport({
     @cInclude("android/log.h");
+    @cInclude("android/font_matcher.h");
 });
 
 pub const std_options: std.Options = .{
@@ -416,9 +417,114 @@ fn initFontGrid(library: font.Library, font_size_pixels: f32) !font.SharedGrid {
         );
     }
 
-    var resolver: font.CodepointResolver = .{ .collection = collection };
+    const embedded_fallbacks = .{
+        .{ font.embedded.symbols_nerd_font, font.default_fallback_adjustment },
+        .{ font.embedded.emoji, font.Collection.SizeAdjustment.none },
+        .{ font.embedded.emoji_text, font.Collection.SizeAdjustment.none },
+    };
+    inline for (embedded_fallbacks) |entry| {
+        _ = try collection.add(
+            allocator,
+            try font.Face.init(library, entry[0], .{ .size = desired_size }),
+            .{
+                .style = .regular,
+                .fallback = true,
+                .size_adjustment = entry[1],
+            },
+        );
+    }
+    var resolver: font.CodepointResolver = .{
+        .collection = collection,
+        .dynamic_fallback = .{ .load = loadAndroidSystemFallback },
+    };
     errdefer resolver.deinit(allocator);
     return font.SharedGrid.init(allocator, resolver);
+}
+
+fn loadAndroidSystemFallback(
+    context: ?*anyopaque,
+    cp: u32,
+    style: font.Style,
+    presentation: ?font.Presentation,
+    options: font.Collection.LoadOptions,
+) ?font.Face {
+    _ = context;
+
+    const matcher = android.AFontMatcher_create() orelse return null;
+    defer android.AFontMatcher_destroy(matcher);
+    android.AFontMatcher_setStyle(
+        matcher,
+        if (style == .bold or style == .bold_italic)
+            android.AFONT_WEIGHT_BOLD
+        else
+            android.AFONT_WEIGHT_NORMAL,
+        style == .italic or style == .bold_italic,
+    );
+
+    var text: [3]u16 = undefined;
+    const base_length: usize = if (cp <= 0xFFFF) bmp: {
+        if (cp >= 0xD800 and cp <= 0xDFFF) return null;
+        text[0] = @intCast(cp);
+        break :bmp 1;
+    } else supplementary: {
+        if (cp > 0x10FFFF) return null;
+        const scalar = cp - 0x10000;
+        text[0] = @intCast(0xD800 + (scalar >> 10));
+        text[1] = @intCast(0xDC00 + (scalar & 0x3FF));
+        break :supplementary 2;
+    };
+    var text_length = base_length;
+    if (presentation) |value| {
+        text[text_length] = switch (value) {
+            .text => 0xFE0E,
+            .emoji => 0xFE0F,
+        };
+        text_length += 1;
+    }
+
+    var run_length: u32 = 0;
+    const system_font = android.AFontMatcher_match(
+        matcher,
+        "monospace",
+        &text,
+        @intCast(text_length),
+        &run_length,
+    ) orelse return null;
+    defer android.AFont_close(system_font);
+    if (run_length < base_length) return null;
+
+    const collection_index = std.math.cast(
+        i32,
+        android.AFont_getCollectionIndex(system_font),
+    ) orelse return null;
+    const path = std.mem.span(android.AFont_getFontFilePath(system_font));
+    var face = font.Face.initFile(
+        options.library,
+        path,
+        collection_index,
+        options.faceOptions(),
+    ) catch |err| {
+        std.log.warn("unable to load Android fallback font path={s} err={}", .{ path, err });
+        return null;
+    };
+
+    var variations: [32]font.face.Variation = undefined;
+    const variation_count = @min(
+        variations.len,
+        android.AFont_getAxisCount(system_font),
+    );
+    for (0..variation_count) |index| {
+        variations[index] = .{
+            .id = @bitCast(android.AFont_getAxisTag(system_font, @intCast(index))),
+            .value = android.AFont_getAxisValue(system_font, @intCast(index)),
+        };
+    }
+    face.setVariations(variations[0..variation_count], options.faceOptions()) catch |err| {
+        face.deinit();
+        std.log.warn("unable to configure Android fallback font path={s} err={}", .{ path, err });
+        return null;
+    };
+    return face;
 }
 
 export fn telepathy_ghostty_render_snapshot(
