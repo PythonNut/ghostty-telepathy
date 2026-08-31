@@ -1018,6 +1018,7 @@ pub const Surface = struct {
     swapchain: c.VkSwapchainKHR = null,
     images: std.ArrayListUnmanaged(c.VkImage) = .{},
     views: std.ArrayListUnmanaged(c.VkImageView) = .{},
+    framebuffers: std.ArrayListUnmanaged(c.VkFramebuffer) = .{},
     render_finished: std.ArrayListUnmanaged(c.VkSemaphore) = .{},
     format: AttachmentFormat = .bgra_srgb,
     extent: c.VkExtent2D = .{ .width = 0, .height = 0 },
@@ -1088,12 +1089,17 @@ pub const Surface = struct {
         for (self.render_finished.items) |semaphore| {
             self.device.vk.vkDestroySemaphore(self.device.device, semaphore, null);
         }
+        for (self.framebuffers.items) |framebuffer| {
+            self.device.vk.vkDestroyFramebuffer(self.device.device, framebuffer, null);
+        }
         for (self.views.items) |view| {
             self.device.vk.vkDestroyImageView(self.device.device, view, null);
         }
+        self.framebuffers.deinit(self.alloc);
         self.views.deinit(self.alloc);
         self.images.deinit(self.alloc);
         self.render_finished.deinit(self.alloc);
+        self.framebuffers = .{};
         self.views = .{};
         self.images = .{};
         self.render_finished = .{};
@@ -1235,6 +1241,17 @@ pub const Surface = struct {
         }
         new_views.ensureTotalCapacity(self.alloc, actual_count) catch
             return error.OutOfMemory;
+        var new_framebuffers: std.ArrayListUnmanaged(c.VkFramebuffer) = .{};
+        errdefer {
+            for (new_framebuffers.items) |framebuffer| self.device.vk.vkDestroyFramebuffer(
+                self.device.device,
+                framebuffer,
+                null,
+            );
+            new_framebuffers.deinit(self.alloc);
+        }
+        new_framebuffers.ensureTotalCapacity(self.alloc, actual_count) catch
+            return error.OutOfMemory;
         var new_render_finished: std.ArrayListUnmanaged(c.VkSemaphore) = .{};
         errdefer {
             for (new_render_finished.items) |semaphore| self.device.vk.vkDestroySemaphore(
@@ -1249,6 +1266,7 @@ pub const Surface = struct {
         const semaphore_info = std.mem.zeroInit(c.VkSemaphoreCreateInfo, .{
             .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         });
+        const render_pass = try self.device.renderPassFor(attachment_format, true);
         for (new_images.items) |image| {
             const view_info = std.mem.zeroInit(c.VkImageViewCreateInfo, .{
                 .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -1272,6 +1290,24 @@ pub const Surface = struct {
             ));
             new_views.appendAssumeCapacity(view);
 
+            const framebuffer_info = std.mem.zeroInit(c.VkFramebufferCreateInfo, .{
+                .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                .renderPass = render_pass,
+                .attachmentCount = 1,
+                .pAttachments = &view,
+                .width = extent.width,
+                .height = extent.height,
+                .layers = 1,
+            });
+            var framebuffer: c.VkFramebuffer = null;
+            try check(self.device.vk.vkCreateFramebuffer(
+                self.device.device,
+                &framebuffer_info,
+                null,
+                &framebuffer,
+            ));
+            new_framebuffers.appendAssumeCapacity(framebuffer);
+
             var render_finished: c.VkSemaphore = null;
             try check(self.device.vk.vkCreateSemaphore(
                 self.device.device,
@@ -1286,6 +1322,7 @@ pub const Surface = struct {
         self.swapchain = new_swapchain;
         self.images = new_images;
         self.views = new_views;
+        self.framebuffers = new_framebuffers;
         self.render_finished = new_render_finished;
         self.format = attachment_format;
         self.extent = extent;
@@ -1330,6 +1367,7 @@ pub const Surface = struct {
             self.active_image = image_index;
             target.image = self.images.items[image_index];
             target.view = self.views.items[image_index];
+            target.framebuffer = self.framebuffers.items[image_index];
             target.width = self.extent.width;
             target.height = self.extent.height;
             target.format = self.format;

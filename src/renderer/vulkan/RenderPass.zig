@@ -132,12 +132,17 @@ fn ensureBegun(self: *Self) vk.Error!void {
         .height = h,
         .layers = 1,
     });
-    var fb: c.VkFramebuffer = null;
-    try vk.check(d.vk.vkCreateFramebuffer(d.device, &fbci, null, &fb));
-    self.slot.deferFramebuffer(fb) catch {
-        d.vk.vkDestroyFramebuffer(d.device, fb, null);
-        return error.OutOfMemory;
+    var fb: c.VkFramebuffer = switch (att.target) {
+        .target => |t| t.framebuffer,
+        .texture => null,
     };
+    if (fb == null) {
+        try vk.check(d.vk.vkCreateFramebuffer(d.device, &fbci, null, &fb));
+        self.slot.deferFramebuffer(fb) catch {
+            d.vk.vkDestroyFramebuffer(d.device, fb, null);
+            return error.OutOfMemory;
+        };
+    }
 
     const cc = att.clear_color orelse [4]f32{ 0, 0, 0, 0 };
     const clear_value = c.VkClearValue{

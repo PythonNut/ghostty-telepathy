@@ -16,6 +16,10 @@ pub const Options = struct {
 
 image: c.VkImage = null,
 view: c.VkImageView = null,
+/// Framebuffer cached for this acquired swapchain image. Texture targets
+/// create transient framebuffers because their views have independent
+/// lifetimes.
+framebuffer: c.VkFramebuffer = null,
 width: usize,
 height: usize,
 format: vk.AttachmentFormat,
@@ -35,4 +39,5 @@ pub fn init(opts: Options) vk.Error!Self {
 pub fn deinit(self: *Self) void {
     self.image = null;
     self.view = null;
+    self.framebuffer = null;
 }
