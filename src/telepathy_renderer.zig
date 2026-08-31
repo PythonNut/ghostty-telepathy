@@ -354,10 +354,10 @@ export fn telepathy_ghostty_render_snapshot(
                 .background_rgba = packRgba(background),
                 .flags = flags,
                 .width = raw.gridWidth(),
-                .grapheme_length = @intCast(@min(
-                    graphemes[x].len,
-                    std.math.maxInt(u8),
-                )),
+                .grapheme_length = if (raw.content_tag == .codepoint_grapheme)
+                    @intCast(@min(graphemes[x].len, std.math.maxInt(u8)))
+                else
+                    0,
             };
             hash.update(std.mem.asBytes(&rendered_cell));
             if (cells) |destination| destination[destination_index] = rendered_cell;
