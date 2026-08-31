@@ -1268,6 +1268,17 @@ pub const Surface = struct {
         if (capabilities.maxImageCount > 0)
             image_count = @min(image_count, capabilities.maxImageCount);
 
+        // Android reports its display rotation as currentTransform even though
+        // ANativeWindow dimensions already follow the app's logical orientation.
+        // Prefer an identity swapchain so WSI does not rotate that content again.
+        const identity_transform: @TypeOf(capabilities.currentTransform) =
+            @intCast(c.VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR);
+        const pre_transform = if (capabilities.supportedTransforms &
+            identity_transform != 0)
+            identity_transform
+        else
+            capabilities.currentTransform;
+
         const create_info = std.mem.zeroInit(c.VkSwapchainCreateInfoKHR, .{
             .sType = c.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             .surface = self.surface,
@@ -1278,7 +1289,7 @@ pub const Surface = struct {
             .imageArrayLayers = 1,
             .imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             .imageSharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
-            .preTransform = capabilities.currentTransform,
+            .preTransform = pre_transform,
             .compositeAlpha = selectCompositeAlpha(capabilities.supportedCompositeAlpha),
             .presentMode = c.VK_PRESENT_MODE_FIFO_KHR,
             .clipped = c.VK_TRUE,
