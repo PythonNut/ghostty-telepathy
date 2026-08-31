@@ -11,9 +11,9 @@
 //! layouts, a render pass cache, a pipeline cache, and an "immediate submit"
 //! helper used for staging uploads.
 //!
-//! Threading: ghostty's GTK apprt sets `must_draw_from_app_thread`, so all
-//! rendering happens on the GTK main thread. Init/deinit also happen there.
-//! A mutex still guards submissions and the caches for safety.
+//! Threading: frame recording happens on the renderer thread. A small Vulkan
+//! completion worker waits for submitted frame fences; the device mutex guards
+//! queue submissions and shared caches.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -50,6 +50,10 @@ pub const Error = error{
     VulkanFailed,
     OutOfMemory,
 };
+
+/// Exactly two reusable frame slots bound CPU/GPU overlap without allowing a
+/// burst of terminal updates to build an unbounded queue of stale work.
+pub const frame_count = 2;
 
 pub fn check(result: c.VkResult) Error!void {
     if (result != c.VK_SUCCESS) {
@@ -316,26 +320,6 @@ pub const Device = struct {
     imm_cmd: c.VkCommandBuffer,
     imm_fence: c.VkFence,
 
-    /// Command buffer + fence used for frame rendering (one frame's GPU
-    /// work is in flight at a time; Frame.complete fence-waits).
-    frame_cmd: c.VkCommandBuffer,
-    frame_fence: c.VkFence,
-
-    /// Descriptor pool reset at the start of every frame.
-    desc_pool: c.VkDescriptorPool,
-
-    /// Framebuffers created during the current frame; destroyed after
-    /// the frame's fence wait (framebuffers are transient per pass).
-    pending_framebuffers: std.ArrayListUnmanaged(c.VkFramebuffer) = .{},
-
-    /// Buffers whose deinit was requested while their last use may
-    /// still sit in a recorded-but-unsubmitted (or in-flight) command
-    /// buffer — e.g. the transient per-placement vertex buffers that
-    /// image.zig deinitializes right after pass.step records them.
-    /// Actually destroyed after the frame's fence wait, mirroring
-    /// pending_framebuffers.
-    pending_buffers: std.ArrayListUnmanaged(PendingBuffer) = .{},
-
     /// Shared descriptor set layouts and the single pipeline layout
     /// every pipeline uses:
     ///   set 0: binding 0 = UBO, binding 1 = readonly SSBO
@@ -352,11 +336,6 @@ pub const Device = struct {
 
     /// Guards queue submissions and the caches.
     mutex: std.Thread.Mutex = .{},
-
-    pub const PendingBuffer = struct {
-        buf: c.VkBuffer,
-        memory: c.VkDeviceMemory,
-    };
 
     pub const PipelineKey = struct {
         vert: usize, // pointer identity of the embedded SPIR-V
@@ -561,28 +540,6 @@ pub const Device = struct {
         try check(vk.vkCreateFence(device, &fci, null, &imm_fence));
         errdefer vk.vkDestroyFence(device, imm_fence, null);
 
-        var frame_cmd: c.VkCommandBuffer = null;
-        try check(vk.vkAllocateCommandBuffers(device, &cbai, &frame_cmd));
-        var frame_fence: c.VkFence = null;
-        try check(vk.vkCreateFence(device, &fci, null, &frame_fence));
-        errdefer vk.vkDestroyFence(device, frame_fence, null);
-
-        // Descriptor pool, reset per frame.
-        const pool_sizes = [_]c.VkDescriptorPoolSize{
-            .{ .type = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 256 },
-            .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256 },
-            .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 512 },
-        };
-        const dpci = std.mem.zeroInit(c.VkDescriptorPoolCreateInfo, .{
-            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .maxSets = 512,
-            .poolSizeCount = @as(u32, pool_sizes.len),
-            .pPoolSizes = &pool_sizes,
-        });
-        var desc_pool: c.VkDescriptorPool = null;
-        try check(vk.vkCreateDescriptorPool(device, &dpci, null, &desc_pool));
-        errdefer vk.vkDestroyDescriptorPool(device, desc_pool, null);
-
         // Descriptor set layouts.
         const globals_bindings = [_]c.VkDescriptorSetLayoutBinding{
             std.mem.zeroInit(c.VkDescriptorSetLayoutBinding, .{
@@ -663,9 +620,6 @@ pub const Device = struct {
             .imm_pool = imm_pool,
             .imm_cmd = imm_cmd,
             .imm_fence = imm_fence,
-            .frame_cmd = frame_cmd,
-            .frame_fence = frame_fence,
-            .desc_pool = desc_pool,
             .set_layout_globals = set_layout_globals,
             .set_layout_textures = set_layout_textures,
             .pipeline_layout = pipeline_layout,
@@ -685,22 +639,9 @@ pub const Device = struct {
             if (rp_opt) |rp| vk.vkDestroyRenderPass(self.device, rp, null);
         };
 
-        for (self.pending_framebuffers.items) |fb| {
-            vk.vkDestroyFramebuffer(self.device, fb, null);
-        }
-        self.pending_framebuffers.deinit(self.alloc);
-
-        for (self.pending_buffers.items) |b| {
-            vk.vkDestroyBuffer(self.device, b.buf, null);
-            vk.vkFreeMemory(self.device, b.memory, null);
-        }
-        self.pending_buffers.deinit(self.alloc);
-
         vk.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
         vk.vkDestroyDescriptorSetLayout(self.device, self.set_layout_textures, null);
         vk.vkDestroyDescriptorSetLayout(self.device, self.set_layout_globals, null);
-        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
-        vk.vkDestroyFence(self.device, self.frame_fence, null);
         vk.vkDestroyFence(self.device, self.imm_fence, null);
         vk.vkDestroyCommandPool(self.device, self.imm_pool, null);
         vk.vkDestroyDevice(self.device, null);
@@ -812,6 +753,260 @@ pub const Device = struct {
     }
 };
 
+pub const PendingBuffer = struct {
+    buf: c.VkBuffer,
+    memory: c.VkDeviceMemory,
+};
+
+/// GPU resources that may only be reused after this slot's fence signals.
+/// Keeping transient destruction and descriptor allocation with the slot is
+/// what makes two frames in flight safe.
+pub const FrameSlot = struct {
+    device: *Device,
+    cmd: c.VkCommandBuffer,
+    fence: c.VkFence,
+    image_available: c.VkSemaphore,
+    desc_pool: c.VkDescriptorPool,
+    pending_framebuffers: std.ArrayListUnmanaged(c.VkFramebuffer) = .{},
+    pending_buffers: std.ArrayListUnmanaged(PendingBuffer) = .{},
+
+    fn init(device: *Device, cmd: c.VkCommandBuffer) Error!FrameSlot {
+        const fence_info = std.mem.zeroInit(c.VkFenceCreateInfo, .{
+            .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        });
+        var fence: c.VkFence = null;
+        try check(device.vk.vkCreateFence(device.device, &fence_info, null, &fence));
+        errdefer device.vk.vkDestroyFence(device.device, fence, null);
+
+        const semaphore_info = std.mem.zeroInit(c.VkSemaphoreCreateInfo, .{
+            .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        });
+        var image_available: c.VkSemaphore = null;
+        try check(device.vk.vkCreateSemaphore(
+            device.device,
+            &semaphore_info,
+            null,
+            &image_available,
+        ));
+        errdefer device.vk.vkDestroySemaphore(device.device, image_available, null);
+
+        const pool_sizes = [_]c.VkDescriptorPoolSize{
+            .{ .type = c.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 256 },
+            .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256 },
+            .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 512 },
+        };
+        const pool_info = std.mem.zeroInit(c.VkDescriptorPoolCreateInfo, .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 512,
+            .poolSizeCount = @as(u32, pool_sizes.len),
+            .pPoolSizes = &pool_sizes,
+        });
+        var desc_pool: c.VkDescriptorPool = null;
+        try check(device.vk.vkCreateDescriptorPool(
+            device.device,
+            &pool_info,
+            null,
+            &desc_pool,
+        ));
+        errdefer device.vk.vkDestroyDescriptorPool(device.device, desc_pool, null);
+
+        return .{
+            .device = device,
+            .cmd = cmd,
+            .fence = fence,
+            .image_available = image_available,
+            .desc_pool = desc_pool,
+        };
+    }
+
+    pub fn begin(self: *FrameSlot) Error!void {
+        try check(self.device.vk.vkResetDescriptorPool(
+            self.device.device,
+            self.desc_pool,
+            0,
+        ));
+        try check(self.device.vk.vkResetCommandBuffer(self.cmd, 0));
+        const begin_info = std.mem.zeroInit(c.VkCommandBufferBeginInfo, .{
+            .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        });
+        try check(self.device.vk.vkBeginCommandBuffer(self.cmd, &begin_info));
+    }
+
+    pub fn waitAndCleanup(self: *FrameSlot) Error!void {
+        const wait_result = self.device.vk.vkWaitForFences(
+            self.device.device,
+            1,
+            &self.fence,
+            c.VK_TRUE,
+            std.math.maxInt(u64),
+        );
+        if (wait_result != c.VK_SUCCESS) {
+            // Never release a reusable frame slot until the device is idle.
+            // The renderer will be marked unhealthy and rebuilt afterward.
+            _ = self.device.vk.vkDeviceWaitIdle(self.device.device);
+            self.cleanupTransients();
+            return check(wait_result);
+        }
+        const reset_result = self.device.vk.vkResetFences(
+            self.device.device,
+            1,
+            &self.fence,
+        );
+        self.cleanupTransients();
+        try check(reset_result);
+    }
+
+    /// Release resources recorded into a command buffer that was never
+    /// submitted, for example when Android surface acquisition fails.
+    pub fn discard(self: *FrameSlot) void {
+        self.cleanupTransients();
+    }
+
+    pub fn deferFramebuffer(self: *FrameSlot, framebuffer: c.VkFramebuffer) Error!void {
+        self.pending_framebuffers.append(self.device.alloc, framebuffer) catch
+            return error.OutOfMemory;
+    }
+
+    pub fn deferBuffer(self: *FrameSlot, buffer: PendingBuffer) Error!void {
+        self.pending_buffers.append(self.device.alloc, buffer) catch
+            return error.OutOfMemory;
+    }
+
+    fn cleanupTransients(self: *FrameSlot) void {
+        for (self.pending_framebuffers.items) |framebuffer| {
+            self.device.vk.vkDestroyFramebuffer(
+                self.device.device,
+                framebuffer,
+                null,
+            );
+        }
+        self.pending_framebuffers.clearRetainingCapacity();
+
+        for (self.pending_buffers.items) |buffer| {
+            self.device.vk.vkDestroyBuffer(self.device.device, buffer.buf, null);
+            self.device.vk.vkFreeMemory(self.device.device, buffer.memory, null);
+        }
+        self.pending_buffers.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *FrameSlot) void {
+        self.cleanupTransients();
+        self.pending_framebuffers.deinit(self.device.alloc);
+        self.pending_buffers.deinit(self.device.alloc);
+        self.device.vk.vkDestroyDescriptorPool(
+            self.device.device,
+            self.desc_pool,
+            null,
+        );
+        self.device.vk.vkDestroySemaphore(
+            self.device.device,
+            self.image_available,
+            null,
+        );
+        self.device.vk.vkDestroyFence(self.device.device, self.fence, null);
+        self.* = undefined;
+    }
+};
+
+/// Per-renderer bounded frame resources. The generic renderer applies the
+/// matching two-permit backpressure policy, so this rotation never reuses a
+/// slot before its completion callback releases the corresponding permit.
+pub const FrameSet = struct {
+    device: *Device,
+    command_pool: c.VkCommandPool,
+    slots: [frame_count]FrameSlot,
+    next_index: usize = 0,
+
+    pub fn init(device: *Device) Error!FrameSet {
+        const pool_info = std.mem.zeroInit(c.VkCommandPoolCreateInfo, .{
+            .sType = c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = device.queue_family,
+        });
+        var command_pool: c.VkCommandPool = null;
+        try check(device.vk.vkCreateCommandPool(
+            device.device,
+            &pool_info,
+            null,
+            &command_pool,
+        ));
+        errdefer device.vk.vkDestroyCommandPool(device.device, command_pool, null);
+
+        var commands: [frame_count]c.VkCommandBuffer = .{null} ** frame_count;
+        const allocate_info = std.mem.zeroInit(c.VkCommandBufferAllocateInfo, .{
+            .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = command_pool,
+            .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = frame_count,
+        });
+        try check(device.vk.vkAllocateCommandBuffers(
+            device.device,
+            &allocate_info,
+            &commands,
+        ));
+
+        var slots: [frame_count]FrameSlot = undefined;
+        var initialized: usize = 0;
+        errdefer for (slots[0..initialized]) |*slot| slot.deinit();
+        for (&slots, commands) |*slot, command| {
+            slot.* = try FrameSlot.init(device, command);
+            initialized += 1;
+        }
+
+        return .{
+            .device = device,
+            .command_pool = command_pool,
+            .slots = slots,
+        };
+    }
+
+    pub fn next(self: *FrameSet) *FrameSlot {
+        const slot = &self.slots[self.next_index];
+        self.next_index = (self.next_index + 1) % frame_count;
+        return slot;
+    }
+
+    pub fn deinit(self: *FrameSet) void {
+        for (&self.slots) |*slot| slot.deinit();
+        self.device.vk.vkDestroyCommandPool(
+            self.device.device,
+            self.command_pool,
+            null,
+        );
+        self.* = undefined;
+    }
+};
+
+threadlocal var recording_slot: ?*FrameSlot = null;
+
+pub fn setRecordingSlot(slot: *FrameSlot) void {
+    std.debug.assert(recording_slot == null);
+    recording_slot = slot;
+}
+
+pub fn clearRecordingSlot(slot: *FrameSlot) void {
+    std.debug.assert(recording_slot == slot);
+    recording_slot = null;
+}
+
+/// Buffers discarded while a frame is being encoded must live until that
+/// frame's fence signals. Outside encoding, the generic frame-state permit
+/// already proves the old buffer is no longer used by the GPU.
+pub fn deferBufferDestroy(buffer: PendingBuffer) void {
+    const device = dev();
+    if (recording_slot) |slot| {
+        slot.deferBuffer(buffer) catch {
+            // Destroying now could race the recorded command buffer. A leak
+            // on this rare allocation failure is safer than a GPU use-after-free.
+            log.warn("leaking VkBuffer: failed to queue deferred destroy", .{});
+        };
+        return;
+    }
+    device.vk.vkDestroyBuffer(device.device, buffer.buf, null);
+    device.vk.vkFreeMemory(device.device, buffer.memory, null);
+}
+
 /// Android presentation state. Ghostty's generic renderer rotates logical
 /// frame resources; Android's compositor owns the actual presentable images.
 /// A Target is therefore populated with the image acquired here at frame
@@ -824,7 +1019,6 @@ pub const Surface = struct {
     images: std.ArrayListUnmanaged(c.VkImage) = .{},
     views: std.ArrayListUnmanaged(c.VkImageView) = .{},
     render_finished: std.ArrayListUnmanaged(c.VkSemaphore) = .{},
-    image_available: c.VkSemaphore = null,
     format: AttachmentFormat = .bgra_srgb,
     extent: c.VkExtent2D = .{ .width = 0, .height = 0 },
     requested_width: u32,
@@ -861,23 +1055,10 @@ pub const Surface = struct {
         ));
         if (present_supported != c.VK_TRUE) return error.VulkanUnavailable;
 
-        const semaphore_info = std.mem.zeroInit(c.VkSemaphoreCreateInfo, .{
-            .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        });
-        var image_available: c.VkSemaphore = null;
-        try check(device.vk.vkCreateSemaphore(
-            device.device,
-            &semaphore_info,
-            null,
-            &image_available,
-        ));
-        errdefer device.vk.vkDestroySemaphore(device.device, image_available, null);
-
         var result: Surface = .{
             .alloc = alloc,
             .device = device,
             .surface = handle,
-            .image_available = image_available,
             .requested_width = width,
             .requested_height = height,
         };
@@ -888,11 +1069,6 @@ pub const Surface = struct {
     pub fn deinit(self: *Surface) void {
         _ = self.device.vk.vkDeviceWaitIdle(self.device.device);
         self.destroySwapchain();
-        if (self.image_available != null) self.device.vk.vkDestroySemaphore(
-            self.device.device,
-            self.image_available,
-            null,
-        );
         if (self.surface != null) self.device.vki.vkDestroySurfaceKHR(
             self.device.instance,
             self.surface,
@@ -1116,7 +1292,11 @@ pub const Surface = struct {
         self.needs_recreate = false;
     }
 
-    pub fn acquire(self: *Surface, target: anytype) Error!void {
+    pub fn acquire(
+        self: *Surface,
+        target: anytype,
+        image_available: c.VkSemaphore,
+    ) Error!void {
         var attempts: u8 = 0;
         while (attempts < 4) : (attempts += 1) {
             if (self.needs_recreate) try self.recreate();
@@ -1125,7 +1305,7 @@ pub const Surface = struct {
                 self.device.device,
                 self.swapchain,
                 std.math.maxInt(u64),
-                self.image_available,
+                image_available,
                 null,
                 &image_index,
             );

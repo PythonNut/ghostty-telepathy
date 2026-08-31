@@ -227,7 +227,7 @@ fn draw(engine: *Engine) bool {
         std.log.err("Ghostty frame update failed: {}", .{err});
         return false;
     };
-    active_renderer.drawFrame(true) catch |err| {
+    active_renderer.drawFrame(false) catch |err| {
         std.log.err("Ghostty frame draw failed: {}", .{err});
         return false;
     };

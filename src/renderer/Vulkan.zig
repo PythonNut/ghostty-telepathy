@@ -1,20 +1,16 @@
-//! Graphics API wrapper for Vulkan with dmabuf presentation.
+//! Graphics API wrapper for Vulkan with Android swapchain presentation.
 //!
-//! Rendering: real VkDevice (v3dv on the Pi CM5), the ported SPIR-V
-//! pipelines, host-visible buffers, staged texture uploads. All GPU
-//! work happens on the GTK main thread (must_draw_from_app_thread).
+//! Rendering: a real VkDevice, Ghostty's SPIR-V pipelines, host-visible
+//! buffers, and staged texture uploads. Recording and submission happen on
+//! Ghostty's renderer thread.
 //!
-//! Presentation: each frame renders into an offscreen VkImage whose
-//! memory is exported as a dmabuf (VK_EXT_external_memory_dma_buf,
-//! LINEAR layout — see vulkan/Target.zig). present() hands the fd to
-//! the GTK apprt, which wraps it in a GdkDmabufTexture and sets it as
-//! the paintable of the surface's GtkPicture. On Wayland GSK can pass
-//! the dmabuf through to the compositor without a copy.
+//! Presentation: each frame renders directly into an image acquired from an
+//! Android VkSwapchainKHR; there is no offscreen copy on the terminal path.
 //!
-//! Synchronization: the frame's command buffer is fence-waited before
-//! present (GL-backend-equivalent of glFinish), so the consumer never
-//! observes a partially rendered buffer. swap_chain_count = 3 keeps
-//! previously presented dmabufs alive while the compositor uses them.
+//! Synchronization: two reusable frame slots permit one frame of CPU/GPU
+//! overlap. A single completion worker waits on their fences and releases
+//! Ghostty's corresponding generic frame states. This bounds queued work and
+//! avoids blocking the renderer thread after every submission.
 pub const Vulkan = @This();
 
 const std = @import("std");
@@ -50,17 +46,98 @@ pub const custom_shader_y_is_down = true;
 /// The Telepathy artifact is embedded without Ghostty's desktop apprt.
 pub const standalone = true;
 
-/// Number of offscreen targets rotated by the generic renderer. Three
-/// (like Metal) so the compositor can still be reading frame N-1/N-2's
-/// dmabuf while we render frame N.
-pub const swap_chain_count = 3;
+/// Match Ghostty's logical frame-state rotation to the Vulkan frame slots.
+pub const swap_chain_count = vk.frame_count;
 
 const log = std.log.scoped(.vulkan);
+
+pub const Completion = struct {
+    renderer: *Renderer,
+    slot: *vk.FrameSlot,
+    health: rendererpkg.Health,
+    submitted: bool,
+    sync: ?*std.Thread.Semaphore = null,
+};
+
+/// One waiter is sufficient because all submissions share one ordered queue.
+/// Its fixed two-entry queue mirrors the two generic and Vulkan frame slots.
+pub const CompletionWorker = struct {
+    alloc: Allocator,
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    entries: [vk.frame_count]Completion = undefined,
+    head: usize = 0,
+    count: usize = 0,
+    stopping: bool = false,
+    thread: ?std.Thread = null,
+
+    fn init(alloc: Allocator) !*CompletionWorker {
+        const self = try alloc.create(CompletionWorker);
+        self.* = .{ .alloc = alloc };
+        errdefer alloc.destroy(self);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    fn deinit(self: *CompletionWorker) void {
+        self.mutex.lock();
+        self.stopping = true;
+        self.condition.signal();
+        self.mutex.unlock();
+        self.thread.?.join();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+
+    pub fn enqueue(self: *CompletionWorker, completion: Completion) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.count < self.entries.len);
+        const tail = (self.head + self.count) % self.entries.len;
+        self.entries[tail] = completion;
+        self.count += 1;
+        self.condition.signal();
+    }
+
+    fn run(self: *CompletionWorker) void {
+        while (true) {
+            self.mutex.lock();
+            while (self.count == 0 and !self.stopping) {
+                self.condition.wait(&self.mutex);
+            }
+            if (self.count == 0 and self.stopping) {
+                self.mutex.unlock();
+                return;
+            }
+            var completion = self.entries[self.head];
+            self.head = (self.head + 1) % self.entries.len;
+            self.count -= 1;
+            self.mutex.unlock();
+
+            if (completion.submitted) {
+                completion.slot.waitAndCleanup() catch |err| {
+                    log.err("frame completion wait failed err={}", .{err});
+                    completion.health = .unhealthy;
+                };
+            } else {
+                completion.slot.discard();
+            }
+            completion.renderer.frameCompleted(completion.health);
+            if (completion.sync) |semaphore| semaphore.post();
+        }
+    }
+};
 
 alloc: Allocator,
 
 /// The shared (refcounted) device context.
 device: *vk.Device,
+
+/// Exactly two per-renderer command/fence/descriptor slots.
+frames: vk.FrameSet,
+
+/// Asynchronous fence waiter for the bounded frame slots.
+completion: *CompletionWorker,
 
 /// Android surface and swapchain state owned by this renderer instance.
 presentation: vk.Surface,
@@ -68,8 +145,7 @@ presentation: vk.Surface,
 /// Alpha blending mode (written back by generic.zig on config change).
 blending: configpkg.Config.AlphaBlending,
 
-/// Current surface size in pixels; updated by the GTK apprt on widget
-/// resize via `setSurfaceSize` (both on the main thread).
+/// Current surface size in pixels, updated by the Android host on resize.
 size: struct { width: u32, height: u32 },
 
 /// The most recently presented target, in case we need to present it again.
@@ -79,16 +155,23 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Vulkan {
     const window: *vk.c.ANativeWindow = @ptrCast(@alignCast(opts.rt_surface));
     const device = try vk.deviceRef(alloc);
     errdefer vk.deviceUnref();
-    const presentation = try vk.Surface.init(
+    var presentation = try vk.Surface.init(
         alloc,
         device,
         window,
         opts.size.screen.width,
         opts.size.screen.height,
     );
+    errdefer presentation.deinit();
+    var frames = try vk.FrameSet.init(device);
+    errdefer frames.deinit();
+    const completion = try CompletionWorker.init(alloc);
+    errdefer completion.deinit();
     return .{
         .alloc = alloc,
         .device = device,
+        .frames = frames,
+        .completion = completion,
         .presentation = presentation,
         .blending = opts.config.blending,
         .size = .{
@@ -99,7 +182,9 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Vulkan {
 }
 
 pub fn deinit(self: *Vulkan) void {
+    self.completion.deinit();
     self.presentation.deinit();
+    self.frames.deinit();
     vk.deviceUnref();
     self.* = undefined;
 }
@@ -335,6 +420,9 @@ pub inline fn beginFrame(
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Frame {
-    try self.presentation.acquire(target);
-    return try Frame.begin(.{}, renderer, target);
+    const slot = self.frames.next();
+    var frame = try Frame.begin(.{ .slot = slot }, renderer, target);
+    errdefer frame.cancel();
+    try self.presentation.acquire(target, slot.image_available);
+    return frame;
 }

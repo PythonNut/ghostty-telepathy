@@ -59,6 +59,7 @@ pub const Step = struct {
 
 attachments: []const Options.Attachment,
 cmd: c.VkCommandBuffer,
+slot: *vk.FrameSlot,
 
 /// Set once the VkRenderPass instance has begun (first step).
 begun: bool = false,
@@ -81,10 +82,15 @@ att_width: u32 = 0,
 att_height: u32 = 0,
 
 /// Begin a render pass.
-pub fn begin(opts: Options, cmd: c.VkCommandBuffer) Self {
+pub fn begin(
+    opts: Options,
+    cmd: c.VkCommandBuffer,
+    slot: *vk.FrameSlot,
+) Self {
     return .{
         .attachments = opts.attachments,
         .cmd = cmd,
+        .slot = slot,
     };
 }
 
@@ -128,13 +134,10 @@ fn ensureBegun(self: *Self) vk.Error!void {
     });
     var fb: c.VkFramebuffer = null;
     try vk.check(d.vk.vkCreateFramebuffer(d.device, &fbci, null, &fb));
-    d.mutex.lock();
-    d.pending_framebuffers.append(d.alloc, fb) catch {
-        d.mutex.unlock();
+    self.slot.deferFramebuffer(fb) catch {
         d.vk.vkDestroyFramebuffer(d.device, fb, null);
         return error.OutOfMemory;
     };
-    d.mutex.unlock();
 
     const cc = att.clear_color orelse [4]f32{ 0, 0, 0, 0 };
     const clear_value = c.VkClearValue{
@@ -204,7 +207,7 @@ fn stepFallible(self: *Self, s: Step) vk.Error!void {
     var sets: [2]c.VkDescriptorSet = .{ null, null };
     const dsai = std.mem.zeroInit(c.VkDescriptorSetAllocateInfo, .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = d.desc_pool,
+        .descriptorPool = self.slot.desc_pool,
         .descriptorSetCount = 2,
         .pSetLayouts = &set_layouts,
     });

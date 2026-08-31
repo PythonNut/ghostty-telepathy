@@ -3,14 +3,12 @@
 //! Buffers are host-visible + host-coherent (the V3D is a UMA GPU: all
 //! its memory types are device-local AND host-visible) and persistently
 //! mapped; `sync` is a memcpy. Growth reallocates at 2x, matching the
-//! GL backend's policy. Safe because every frame's GPU work is
-//! fence-waited before the buffers are reused (see Frame.complete).
+//! GL backend's policy. Each logical frame owns its buffers until the
+//! corresponding Vulkan frame slot completes.
 const std = @import("std");
 
 const vk = @import("vk.zig");
 const c = vk.c;
-
-const log = std.log.scoped(.vulkan);
 
 /// Options for initializing a buffer.
 pub const Options = struct {
@@ -93,23 +91,15 @@ pub const Raw = struct {
     /// been submitted yet (image.zig deinitializes its transient
     /// per-placement vertex buffers right after pass.step records
     /// them; submission happens later in Frame.complete). Instead the
-    /// buffer is queued on the device and destroyed after the frame
-    /// fence signals (Frame.submitAndWait), or at device teardown.
+    /// buffer is queued on the recording slot and destroyed after that
+    /// slot's fence signals. Buffers retired outside frame recording belong
+    /// to an already-released generic frame state and can be freed directly.
     pub fn deinit(self: Raw) void {
         if (self.buf == null) return;
-        const d = vk.dev();
-        d.mutex.lock();
-        defer d.mutex.unlock();
-        d.pending_buffers.append(d.alloc, .{
+        vk.deferBufferDestroy(.{
             .buf = self.buf,
             .memory = self.memory,
-        }) catch {
-            // Allocation failure tracking the buffer. Destroying it
-            // now would be unsafe (it may be recorded in the pending
-            // frame command buffer, which a queue drain can't cover),
-            // so leak it — strictly better than a GPU use-after-free.
-            log.warn("leaking VkBuffer: failed to queue deferred destroy", .{});
-        };
+        });
     }
 };
 
